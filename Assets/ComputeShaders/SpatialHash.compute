@@ -1,0 +1,71 @@
+// ============================================================================
+// SpatialHash.compute — Fast atomic spatial hashing for SPH
+// Swinging Paint Bucket Simulation
+// ============================================================================
+// Builds a grid of particle indices for O(1) neighbor lookups.
+// Uses a fixed-size cell approach to avoid bitonic sorting or prefix sums.
+// ============================================================================
+
+#pragma kernel ClearGrid
+#pragma kernel HashParticles
+
+#define THREAD_GROUP_SIZE 256
+#define MAX_PARTICLES_PER_CELL 64
+
+RWStructuredBuffer<int> _CellStart;
+RWStructuredBuffer<int> _CellEnd;
+RWStructuredBuffer<int> _SortedIndices;
+
+StructuredBuffer<float3> _Positions;
+StructuredBuffer<int> _ParticleStates;
+
+float _CellSize;
+int _GridSize;
+int _ParticleCount;
+
+int3 GetCell(float3 pos)
+{
+    return int3(
+        (int)floor(pos.x / _CellSize),
+        (int)floor(pos.y / _CellSize),
+        (int)floor(pos.z / _CellSize)
+    );
+}
+
+int HashCell(int3 cell)
+{
+    int hash = (cell.x * 73856093) ^ (cell.y * 19349663) ^ (cell.z * 83492791);
+    return abs(hash) % _GridSize;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ClearGrid(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridSize) return;
+    
+    _CellStart[id.x] = id.x * MAX_PARTICLES_PER_CELL;
+    _CellEnd[id.x] = id.x * MAX_PARTICLES_PER_CELL;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void HashParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_ParticleCount) return;
+    if (_ParticleStates[i] != 1) return; // 1 = InBucket
+    
+    int3 cell = GetCell(_Positions[i]);
+    int hash = HashCell(cell);
+    
+    int currentOffset;
+    InterlockedAdd(_CellEnd[hash], 1, currentOffset);
+    
+    if (currentOffset - (hash * MAX_PARTICLES_PER_CELL) < MAX_PARTICLES_PER_CELL)
+    {
+        _SortedIndices[currentOffset] = i;
+    }
+    else
+    {
+        InterlockedAdd(_CellEnd[hash], -1); // Revert overflow
+    }
+}

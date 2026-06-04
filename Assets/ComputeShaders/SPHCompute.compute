@@ -1,0 +1,261 @@
+// ============================================================================
+// SPHCompute.compute — GPU Compute Shader for SPH fluid simulation
+// Swinging Paint Bucket Simulation
+// ============================================================================
+// Implements SPH density, pressure, and force computation on GPU.
+// From study:
+//   ρᵢ = Σⱼ mⱼ W(rᵢ - rⱼ, h)     [Poly6 kernel]
+//   Pᵢ = k(ρᵢ - ρ₀)
+//   F_pressure = -Σⱼ mⱼ (Pᵢ+Pⱼ)/(2ρⱼ) ∇W   [Spiky gradient]
+//   F_viscosity = μ Σⱼ mⱼ (vⱼ-vᵢ)/ρⱼ ∇²W   [Viscosity Laplacian]
+//   F_inertial = -mᵢ a_bucket - 2mᵢ(ω×vᵢ) - mᵢ(ω×(ω×rᵢ))
+// ============================================================================
+
+#pragma kernel ComputeDensityPressure
+#pragma kernel ComputeForces
+#pragma kernel Integrate
+
+// ── Constants ────────────────────────────────────────────────────────────
+#define PI 3.14159265358979
+#define THREAD_GROUP_SIZE 256
+
+// ── Buffers ──────────────────────────────────────────────────────────────
+RWStructuredBuffer<float3> _Positions;
+RWStructuredBuffer<float3> _Velocities;
+RWStructuredBuffer<float> _Densities;
+RWStructuredBuffer<float> _Pressures;
+RWStructuredBuffer<float3> _Forces;
+StructuredBuffer<float> _Masses;
+StructuredBuffer<int> _ParticleStates; // 1 = InBucket
+
+// ── Spatial Hash ─────────────────────────────────────────────────────────
+StructuredBuffer<int> _CellStart;
+StructuredBuffer<int> _CellEnd;
+StructuredBuffer<int> _SortedIndices;
+
+// ── Uniforms ─────────────────────────────────────────────────────────────
+float _SmoothingRadius;      // h
+float _SmoothingRadiusSqr;   // h²
+float _RestDensity;          // ρ₀
+float _Stiffness;            // k in P = k(ρ - ρ₀)
+float _Viscosity;            // μ
+float _DeltaTime;            // Δt
+float _Gravity;              // g
+float3 _BucketAcceleration;  // a_bucket
+float3 _BucketAngularVelocity; // ω
+int _ParticleCount;
+int _GridSize;
+float _CellSize;
+
+// ── Poly6 Kernel ─────────────────────────────────────────────────────────
+// W(r, h) = (315 / 64πh⁹) · (h² - |r|²)³
+float Poly6(float rSqr, float hSqr, float h9)
+{
+    if (rSqr >= hSqr) return 0.0;
+    float diff = hSqr - rSqr;
+    return (315.0 / (64.0 * PI * h9)) * diff * diff * diff;
+}
+
+// ── Spiky Kernel Gradient ────────────────────────────────────────────────
+// ∇W(r, h) = (-45 / πh⁶) · (h - |r|)² · r̂
+float3 SpikyGrad(float3 r, float rMag, float h, float h6)
+{
+    if (rMag < 1e-6 || rMag >= h) return float3(0, 0, 0);
+    float diff = h - rMag;
+    float coeff = (-45.0 / (PI * h6)) * diff * diff / rMag;
+    return coeff * r;
+}
+
+// ── Viscosity Kernel Laplacian ───────────────────────────────────────────
+// ∇²W(r, h) = (45 / πh⁶) · (h - |r|)
+float ViscosityLap(float rMag, float h, float h6)
+{
+    if (rMag >= h) return 0.0;
+    return (45.0 / (PI * h6)) * (h - rMag);
+}
+
+// ── Spatial Hash Helper ──────────────────────────────────────────────────
+int3 GetCell(float3 pos)
+{
+    return int3(
+        (int)floor(pos.x / _CellSize),
+        (int)floor(pos.y / _CellSize),
+        (int)floor(pos.z / _CellSize)
+    );
+}
+
+int HashCell(int3 cell)
+{
+    // Simple spatial hash
+    int hash = (cell.x * 73856093) ^ (cell.y * 19349663) ^ (cell.z * 83492791);
+    return abs(hash) % _GridSize;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL 1: Compute Density and Pressure
+// ρᵢ = Σⱼ mⱼ W(rᵢ - rⱼ)
+// Pᵢ = k(ρᵢ - ρ₀)
+// ═══════════════════════════════════════════════════════════════════════════
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeDensityPressure(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_ParticleCount) return;
+    if (_ParticleStates[i] != 1) return; // Only bucket particles
+
+    float3 posI = _Positions[i];
+    float hSqr = _SmoothingRadiusSqr;
+    float h9 = _SmoothingRadius * hSqr * hSqr * hSqr * hSqr;
+    
+    float density = 0.0;
+    
+    // Search neighboring cells
+    int3 cellI = GetCell(posI);
+    
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            for (int dz = -1; dz <= 1; dz++)
+            {
+                int3 neighborCell = cellI + int3(dx, dy, dz);
+                int hash = HashCell(neighborCell);
+                
+                int start = _CellStart[hash];
+                int end = _CellEnd[hash];
+                
+                for (int j = start; j < end; j++)
+                {
+                    int neighborIdx = _SortedIndices[j];
+                    if (_ParticleStates[neighborIdx] != 1) continue;
+                    
+                    float3 r = posI - _Positions[neighborIdx];
+                    float rSqr = dot(r, r);
+                    
+                    density += _Masses[neighborIdx] * Poly6(rSqr, hSqr, h9);
+                }
+            }
+        }
+    }
+    
+    _Densities[i] = max(density, 1e-6);
+    _Pressures[i] = _Stiffness * (density - _RestDensity);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL 2: Compute Forces
+// F_pressure = -Σⱼ mⱼ (Pᵢ+Pⱼ)/(2ρⱼ) ∇W
+// F_viscosity = μ Σⱼ mⱼ (vⱼ-vᵢ)/ρⱼ ∇²W
+// F_gravity = (0, -mᵢg, 0)
+// F_inertial = -mᵢ a_bucket - 2mᵢ(ω×vᵢ) - mᵢ(ω×(ω×rᵢ))
+// ═══════════════════════════════════════════════════════════════════════════
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeForces(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_ParticleCount) return;
+    if (_ParticleStates[i] != 1) return;
+    
+    float3 posI = _Positions[i];
+    float3 velI = _Velocities[i];
+    float massI = _Masses[i];
+    float densityI = _Densities[i];
+    float pressureI = _Pressures[i];
+    
+    float h = _SmoothingRadius;
+    float h6 = h * h * h * h * h * h;
+    
+    float3 fPressure = float3(0, 0, 0);
+    float3 fViscosity = float3(0, 0, 0);
+    
+    // Search neighbors
+    int3 cellI = GetCell(posI);
+    
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            for (int dz = -1; dz <= 1; dz++)
+            {
+                int3 neighborCell = cellI + int3(dx, dy, dz);
+                int hash = HashCell(neighborCell);
+                
+                int start = _CellStart[hash];
+                int end = _CellEnd[hash];
+                
+                for (int j = start; j < end; j++)
+                {
+                    int neighborIdx = _SortedIndices[j];
+                    if (neighborIdx == (int)i) continue;
+                    if (_ParticleStates[neighborIdx] != 1) continue;
+                    
+                    float3 r = posI - _Positions[neighborIdx];
+                    float rMag = length(r);
+                    
+                    if (rMag >= h || rMag < 1e-6) continue;
+                    
+                    float massJ = _Masses[neighborIdx];
+                    float densityJ = _Densities[neighborIdx];
+                    float pressureJ = _Pressures[neighborIdx];
+                    float3 velJ = _Velocities[neighborIdx];
+                    
+                    // Pressure force: -mⱼ(Pᵢ+Pⱼ)/(2ρⱼ) ∇W
+                    float3 gradW = SpikyGrad(r, rMag, h, h6);
+                    float pressureTerm = (pressureI + pressureJ) / (2.0 * max(densityJ, 1e-6));
+                    fPressure -= massJ * pressureTerm * gradW;
+                    
+                    // Viscosity force: μ mⱼ(vⱼ-vᵢ)/ρⱼ ∇²W
+                    float lapW = ViscosityLap(rMag, h, h6);
+                    fViscosity += _Viscosity * massJ * (velJ - velI) / max(densityJ, 1e-6) * lapW;
+                }
+            }
+        }
+    }
+    
+    // Gravity: F_g = (0, -mᵢg, 0)
+    float3 fGravity = float3(0, -massI * _Gravity, 0);
+    
+    // Inertial forces (non-inertial frame of bucket):
+    // F_inertial = -mᵢ a_bucket - 2mᵢ(ω × vᵢ) - mᵢ(ω × (ω × rᵢ))
+    float3 fInertial = -massI * _BucketAcceleration;
+    
+    // Coriolis: -2mᵢ(ω × vᵢ)
+    float3 coriolis = -2.0 * massI * cross(_BucketAngularVelocity, velI);
+    fInertial += coriolis;
+    
+    // Centrifugal: -mᵢ(ω × (ω × rᵢ))
+    float3 centrifugal = -massI * cross(_BucketAngularVelocity, cross(_BucketAngularVelocity, posI));
+    fInertial += centrifugal;
+    
+    // Total force: Fᵢ = Fg + Fpressure + Fviscosity + Finertial
+    _Forces[i] = fGravity + fPressure + fViscosity + fInertial;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL 3: Integrate
+// aᵢ = Fᵢ / mᵢ
+// vᵢ(t+Δt) = vᵢ(t) + aᵢΔt
+// rᵢ(t+Δt) = rᵢ(t) + vᵢΔt
+// ═══════════════════════════════════════════════════════════════════════════
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_ParticleCount) return;
+    if (_ParticleStates[i] != 1) return;
+    
+    float massI = _Masses[i];
+    if (massI < 1e-6) return;
+    
+    // a = F / m
+    float3 acceleration = _Forces[i] / massI;
+    
+    // v(t+Δt) = v(t) + a Δt
+    float3 newVel = _Velocities[i] + acceleration * _DeltaTime;
+    
+    // r(t+Δt) = r(t) + v Δt
+    float3 newPos = _Positions[i] + newVel * _DeltaTime;
+    
+    _Velocities[i] = newVel;
+    _Positions[i] = newPos;
+}

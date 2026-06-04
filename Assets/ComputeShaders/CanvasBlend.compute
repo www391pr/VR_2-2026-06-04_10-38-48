@@ -1,0 +1,171 @@
+// ============================================================================
+// CanvasBlend.compute — GPU canvas paint texture blending
+// Swinging Paint Bucket Simulation
+// ============================================================================
+// Renders paint particles onto a RenderTexture canvas.
+// Handles splat stamping, color diffusion, and thickness accumulation.
+// ============================================================================
+
+#pragma kernel StampParticles
+#pragma kernel DiffuseColors
+
+#define THREAD_GROUP_SIZE_X 8
+#define THREAD_GROUP_SIZE_Y 8
+
+// ── Textures ─────────────────────────────────────────────────────────────
+RWTexture2D<float4> _CanvasColorTexture;   // RGBA paint color
+RWTexture2D<float> _CanvasHeightTexture;    // Paint thickness h(x,y)
+
+// ── Particle Data ────────────────────────────────────────────────────────
+StructuredBuffer<float3> _ParticlePositions;
+StructuredBuffer<float4> _ParticleColors;
+StructuredBuffer<float> _ParticleMasses;
+StructuredBuffer<int> _ParticleStates;
+
+// ── Uniforms ─────────────────────────────────────────────────────────────
+int _TextureSize;
+float _CanvasWidth;
+float _CanvasHeight;
+float _CanvasOffsetX;
+float _CanvasOffsetZ;
+int _CanvasParticleCount;
+float _SplatRadius;         // Radius of paint splat in texture pixels
+float _DiffusionRate;       // Color diffusion rate Dc
+float _DeltaTime;
+
+#define STATE_CANVAS 3
+#define EPSILON 1e-6
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL: Stamp Particles onto Canvas Texture
+// Projects canvas particles onto the 2D texture and accumulates paint.
+// ═══════════════════════════════════════════════════════════════════════════
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
+void StampParticles(uint3 id : SV_DispatchThreadID)
+{
+    int2 texCoord = int2(id.xy);
+    if (texCoord.x >= _TextureSize || texCoord.y >= _TextureSize) return;
+    
+    // Convert texture coordinate to world position
+    float worldX = (float)texCoord.x / _TextureSize * _CanvasWidth - _CanvasWidth * 0.5 + _CanvasOffsetX;
+    float worldZ = (float)texCoord.y / _TextureSize * _CanvasHeight - _CanvasHeight * 0.5 + _CanvasOffsetZ;
+    
+    float4 currentColor = _CanvasColorTexture[texCoord];
+    float currentHeight = _CanvasHeightTexture[texCoord];
+    
+    float totalMassAdded = 0.0;
+    float4 colorAccum = float4(0, 0, 0, 0);
+    
+    // Check all canvas particles
+    // Note: In production, use a spatial structure to avoid O(n) per pixel
+    // For now, we process particles that are near this texel
+    float texelSizeX = _CanvasWidth / _TextureSize;
+    float texelSizeZ = _CanvasHeight / _TextureSize;
+    
+    for (int i = 0; i < _CanvasParticleCount; i++)
+    {
+        if (_ParticleStates[i] != STATE_CANVAS) continue;
+        
+        float3 pPos = _ParticlePositions[i];
+        float pMass = _ParticleMasses[i];
+        
+        if (pMass < EPSILON) continue;
+        
+        // Distance from texel center to particle (in world space)
+        float dx = pPos.x - worldX;
+        float dz = pPos.z - worldZ;
+        float distSqr = dx * dx + dz * dz;
+        
+        float splatRadiusWorld = _SplatRadius * texelSizeX;
+        float splatRadiusSqr = splatRadiusWorld * splatRadiusWorld;
+        
+        if (distSqr < splatRadiusSqr)
+        {
+            // Weight based on distance (Gaussian-like falloff)
+            float weight = 1.0 - distSqr / splatRadiusSqr;
+            weight = weight * weight; // Smoother falloff
+            
+            float4 pColor = _ParticleColors[i];
+            colorAccum += pColor * pMass * weight;
+            totalMassAdded += pMass * weight;
+        }
+    }
+    
+    // Blend with existing canvas
+    if (totalMassAdded > EPSILON)
+    {
+        float4 newPaintColor = colorAccum / totalMassAdded;
+        
+        // Blend: existing + new based on mass
+        float existingMass = currentHeight;
+        float totalMass = existingMass + totalMassAdded;
+        
+        if (totalMass > EPSILON)
+        {
+            float4 blendedColor = (currentColor * existingMass + newPaintColor * totalMassAdded) / totalMass;
+            blendedColor = clamp(blendedColor, 0.0, 1.0);
+            
+            _CanvasColorTexture[texCoord] = blendedColor;
+            _CanvasHeightTexture[texCoord] = totalMass;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL: Diffuse Colors
+// From study: dCi/dt = Dc Σj (Cj - Ci) Wij
+// Implemented as a simple 2D diffusion on the texture.
+// ═══════════════════════════════════════════════════════════════════════════
+[numthreads(THREAD_GROUP_SIZE_X, THREAD_GROUP_SIZE_Y, 1)]
+void DiffuseColors(uint3 id : SV_DispatchThreadID)
+{
+    int2 texCoord = int2(id.xy);
+    if (texCoord.x >= _TextureSize || texCoord.y >= _TextureSize) return;
+    if (texCoord.x <= 0 || texCoord.y <= 0) return;
+    if (texCoord.x >= _TextureSize - 1 || texCoord.y >= _TextureSize - 1) return;
+    
+    float4 center = _CanvasColorTexture[texCoord];
+    float centerH = _CanvasHeightTexture[texCoord];
+    
+    // Only diffuse where there is paint
+    if (centerH < EPSILON) return;
+    
+    // 5-point Laplacian stencil for diffusion
+    float4 left = _CanvasColorTexture[int2(texCoord.x - 1, texCoord.y)];
+    float4 right = _CanvasColorTexture[int2(texCoord.x + 1, texCoord.y)];
+    float4 up = _CanvasColorTexture[int2(texCoord.x, texCoord.y + 1)];
+    float4 down = _CanvasColorTexture[int2(texCoord.x, texCoord.y - 1)];
+    
+    float hLeft = _CanvasHeightTexture[int2(texCoord.x - 1, texCoord.y)];
+    float hRight = _CanvasHeightTexture[int2(texCoord.x + 1, texCoord.y)];
+    float hUp = _CanvasHeightTexture[int2(texCoord.x, texCoord.y + 1)];
+    float hDown = _CanvasHeightTexture[int2(texCoord.x, texCoord.y - 1)];
+    
+    // Only blend with neighbors that have paint
+    float4 colorDelta = float4(0, 0, 0, 0);
+    float totalWeight = 0.0;
+    
+    if (hLeft > EPSILON) { colorDelta += left - center; totalWeight += 1.0; }
+    if (hRight > EPSILON) { colorDelta += right - center; totalWeight += 1.0; }
+    if (hUp > EPSILON) { colorDelta += up - center; totalWeight += 1.0; }
+    if (hDown > EPSILON) { colorDelta += down - center; totalWeight += 1.0; }
+    
+    if (totalWeight > 0.0)
+    {
+        float4 diffusion = _DiffusionRate * _DeltaTime * colorDelta;
+        float4 newColor = center + diffusion;
+        newColor = clamp(newColor, 0.0, 1.0);
+        _CanvasColorTexture[texCoord] = newColor;
+    }
+    
+    // Spread height (paint flows to neighbors)
+    float heightDelta = 0.0;
+    if (hLeft < centerH) heightDelta += (centerH - hLeft);
+    if (hRight < centerH) heightDelta += (centerH - hRight);
+    if (hUp < centerH) heightDelta += (centerH - hUp);
+    if (hDown < centerH) heightDelta += (centerH - hDown);
+    
+    // Very gentle height spreading
+    float spreadAmount = heightDelta * _DiffusionRate * _DeltaTime * 0.01;
+    _CanvasHeightTexture[texCoord] = max(centerH - spreadAmount, 0.0);
+}

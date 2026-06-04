@@ -1,0 +1,186 @@
+// ============================================================================
+// ParticleUpdate.compute — GPU particle update for free-fall and canvas
+// Swinging Paint Bucket Simulation
+// ============================================================================
+// Handles large-scale particle updates on GPU.
+// From study:
+//   Free-fall: F = Fg + Fd + Fsurface + Fwind
+//   Canvas: F = mg_tangent + F_friction + F_viscous + F_spread
+// ============================================================================
+
+#pragma kernel UpdateFreeFallParticles
+#pragma kernel UpdateCanvasParticles
+
+#define THREAD_GROUP_SIZE 256
+
+// ── Buffers ──────────────────────────────────────────────────────────────
+RWStructuredBuffer<float3> _Positions;
+RWStructuredBuffer<float3> _Velocities;
+RWStructuredBuffer<float> _Masses;
+RWStructuredBuffer<float4> _Colors;
+RWStructuredBuffer<int> _States;      // ParticleState enum
+RWStructuredBuffer<float> _Lifetimes;
+RWStructuredBuffer<float> _Radii;
+
+// ── Uniforms ─────────────────────────────────────────────────────────────
+float _DeltaTime;
+float _Gravity;
+float _AirDensity;
+float _AirDragCoefficient;
+float _SurfaceTension;
+int _ParticleCount;
+float3 _WindVelocity;
+float _WindCoefficient;
+int _WindEnabled;
+
+// Canvas parameters
+float _CanvasY;
+float3 _CanvasNormal;
+float _Friction;
+float _Absorption;
+float _Viscosity;
+float _Restitution;
+
+#define STATE_DEAD 0
+#define STATE_BUCKET 1
+#define STATE_FREEFALL 2
+#define STATE_CANVAS 3
+
+#define PI 3.14159265358979
+#define EPSILON 1e-6
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL: Update Free-Fall Particles
+// From study:
+//   F_g = (0, -mg, 0)
+//   F_d = -½ ρ_air Cd A |v| v
+//   F_wind = kw(v_wind - v)
+//   v(t+Δt) = v(t) + (F/m)Δt
+//   r(t+Δt) = r(t) + v Δt
+// ═══════════════════════════════════════════════════════════════════════════
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void UpdateFreeFallParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_ParticleCount) return;
+    if (_States[i] != STATE_FREEFALL) return;
+    
+    float3 pos = _Positions[i];
+    float3 vel = _Velocities[i];
+    float mass = _Masses[i];
+    float radius = _Radii[i];
+    
+    if (mass < EPSILON) { _States[i] = STATE_DEAD; return; }
+    
+    float3 totalForce = float3(0, 0, 0);
+    
+    // Gravity: F_g = (0, -mg, 0)
+    totalForce.y -= mass * _Gravity;
+    
+    // Air drag: F_d = -½ ρ Cd A |v| v
+    float speed = length(vel);
+    if (speed > EPSILON)
+    {
+        float dragArea = PI * radius * radius;
+        float dragMag = 0.5 * _AirDensity * _AirDragCoefficient * dragArea * speed;
+        totalForce -= dragMag * normalize(vel);
+    }
+    
+    // Wind: F_wind = kw(v_wind - v)
+    if (_WindEnabled > 0)
+    {
+        totalForce += _WindCoefficient * (_WindVelocity - vel);
+    }
+    
+    // Integrate
+    float3 accel = totalForce / mass;
+    vel += accel * _DeltaTime;
+    pos += vel * _DeltaTime;
+    
+    _Lifetimes[i] += _DeltaTime;
+    
+    // Canvas impact detection
+    float distToCanvas = dot(pos - float3(0, _CanvasY, 0), _CanvasNormal);
+    if (distToCanvas <= 0)
+    {
+        // Snap to canvas
+        pos -= distToCanvas * _CanvasNormal;
+        
+        // Collision response: v_after = -e(v·n̂)n̂ + (v - (v·n̂)n̂)
+        float vn = dot(vel, _CanvasNormal);
+        float3 vNormal = vn * _CanvasNormal;
+        float3 vTangent = vel - vNormal;
+        vel = -_Restitution * vNormal + vTangent;
+        
+        _States[i] = STATE_CANVAS;
+    }
+    
+    // Bounds check
+    if (pos.y < _CanvasY - 5.0 || _Lifetimes[i] > 30.0)
+    {
+        _States[i] = STATE_DEAD;
+    }
+    
+    _Positions[i] = pos;
+    _Velocities[i] = vel;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL: Update Canvas Particles
+// From study:
+//   g_tangent = g - (g·n̂)n̂
+//   F_flow = m g_tangent
+//   F_friction = -k v_tangent
+//   F = mg_tangent + F_friction + F_viscous + F_spread
+//   dm/dt = -αm
+// ═══════════════════════════════════════════════════════════════════════════
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void UpdateCanvasParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_ParticleCount) return;
+    if (_States[i] != STATE_CANVAS) return;
+    
+    float3 pos = _Positions[i];
+    float3 vel = _Velocities[i];
+    float mass = _Masses[i];
+    
+    if (mass < EPSILON * 0.01) return;
+    
+    // Gravity decomposition
+    float3 gravity = float3(0, -_Gravity, 0);
+    float3 gNormal = dot(gravity, _CanvasNormal) * _CanvasNormal;
+    float3 gTangent = gravity - gNormal;
+    
+    // F_flow = m g_tangent
+    float3 flowForce = mass * gTangent;
+    
+    // F_friction = -k v_tangent
+    float3 vTangent = vel - dot(vel, _CanvasNormal) * _CanvasNormal;
+    float3 frictionForce = -_Friction * vTangent;
+    
+    // Total force
+    float3 totalForce = flowForce + frictionForce;
+    
+    // Integrate
+    float3 accel = totalForce / mass;
+    vel += accel * _DeltaTime;
+    
+    // Remove normal component
+    vel = vel - dot(vel, _CanvasNormal) * _CanvasNormal;
+    
+    // Viscosity damping
+    float damping = exp(-_Viscosity * _DeltaTime * 10.0);
+    vel *= damping;
+    
+    pos += vel * _DeltaTime;
+    
+    // Absorption: dm/dt = -αm
+    mass -= _Absorption * mass * _DeltaTime;
+    mass = max(mass, 0.0);
+    
+    _Positions[i] = pos;
+    _Velocities[i] = vel;
+    _Masses[i] = mass;
+    _Lifetimes[i] += _DeltaTime;
+}

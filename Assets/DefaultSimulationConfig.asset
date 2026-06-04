@@ -1,0 +1,78 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 6e8c63c596061f94994477cda9391651, type: 3}
+  m_Name: DefaultSimulationConfig
+  m_EditorClassIdentifier: Assembly-CSharp::SwingingPaintBucket.Core.SimulationConfig
+  bucket:
+    mass: 0.5
+    radius: 0.1
+    height: 0.15
+    shape: 0
+    conicalSlope: 0
+    orificeRadius: 0.005
+    orificeShape: 0
+    orificePosition: 0
+    slitWidth: 0.003
+    slitLength: 0.02
+    orificeOffsetFromCenter: 0
+  rope:
+    length: 1.5
+    isElastic: 0
+    stiffness: 5000
+    damping: 10
+    torsionStiffness: 0.5
+    frictionDamping: 0.01
+  motion:
+    initialThetaDegrees: 30
+    initialPhiDegrees: 0
+    initialVelocity: 0
+    initialVelocityDirectionDegrees: 0
+    maxSwingCount: 0
+  paint:
+    initialVolume: 0.002
+    density: 1300
+    viscosity: 0.5
+    surfaceTension: 0.035
+    restDensity: 1300
+    sphStiffness: 50
+    smoothingRadius: 0.04
+    colors:
+    - {r: 1, g: 0, b: 0, a: 1}
+    weberCritical: 50
+    splashCountCoefficient: 5
+    splashMassFraction: 0.1
+    splashVelocityFraction: 0.3
+    colorDiffusionRate: 0.01
+    mixingConstant: 2
+  canvas:
+    width: 2
+    height: 2
+    surfaceType: 0
+    inclinationDegrees: 0
+    inclinationDirectionDegrees: 0
+    yPosition: 0
+    textureResolution: 2048
+  environment:
+    gravity: 9.81
+    airDensity: 1.225
+    airDampingCoefficient: 0.02
+    windEnabled: 0
+    windVelocity: {x: 0, y: 0, z: 0}
+    windCoefficient: 1
+    humidity: 0.5
+    temperature: 293.15
+    humidityViscosityFactor: 0.2
+  suspension:
+    position: {x: 0, y: 3, z: 0}
+  fixedTimeStep: 0.005
+  maxParticles: 1000000
+  particleMass: 0.001
